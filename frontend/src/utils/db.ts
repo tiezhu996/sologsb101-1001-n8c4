@@ -3,13 +3,15 @@ import type { Turbine } from '@/types/turbine'
 import type { Blade, BladeMaterial, BladeSerial } from '@/types/blade'
 import type { Segment, SegmentFace } from '@/types/segment'
 import type { Defect, DefectState, DefectType, Severity } from '@/types/defect'
+import { normalizeDefect } from '@/types/defect'
 import type { WorkOrder, WorkOrderState } from '@/types/workOrder'
+import { defectIdsOf, normalizeWorkOrder } from '@/types/workOrder'
 
 /** 本地 IndexedDB 库名 */
 export const DB_NAME = 'gbwindblade'
 
 /** 本地结构版本号：新增 / 修改表结构时必须递增，并补充 upgrade 迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** localStorage 侧的少量元数据键 */
 export const LS_KEYS = {
@@ -66,7 +68,7 @@ export class WindBladeDatabase extends Dexie {
       workOrders: 'id, defectId, team, state, updatedAt'
     })
     // v2：分段补充检修面索引，缺陷补充面位 / 状态 / 发现日期索引，工单补充限期索引
-    this.version(DB_VERSION)
+    this.version(2)
       .stores({
         turbines: 'id, code, model, commissionDate, updatedAt',
         blades: 'id, turbineId, serial, material, updatedAt',
@@ -101,6 +103,36 @@ export class WindBladeDatabase extends Dexie {
             if (!segment.face) segment.face = 'PS'
           })
       })
+    // v3：工单升级为作业单（一单多缺陷，*defectIds 多值索引），
+    // 状态「待验收」更名「待复验」，缺陷补充修复结果登记字段
+    this.version(DB_VERSION)
+      .stores({
+        turbines: 'id, code, model, commissionDate, updatedAt',
+        blades: 'id, turbineId, serial, material, updatedAt',
+        segments: 'id, bladeId, index, face, updatedAt',
+        defects: 'id, segmentId, type, severity, face, state, foundAt, updatedAt',
+        workOrders: 'id, *defectIds, team, state, dueDate, updatedAt'
+      })
+      .upgrade(async (tx) => {
+        // 迁移：旧数据一条缺陷一张工单，按兼容方式读入为单缺陷作业单
+        await tx
+          .table<WorkOrder>('workOrders')
+          .toCollection()
+          .modify((order) => {
+            const normalized = normalizeWorkOrder(order)
+            order.defectIds = normalized.defectIds
+            order.state = normalized.state
+            delete order.defectId
+          })
+        await tx
+          .table<Defect>('defects')
+          .toCollection()
+          .modify((defect) => {
+            const normalized = normalizeDefect(defect)
+            defect.repairResult = normalized.repairResult
+            defect.repairedAt = normalized.repairedAt
+          })
+      })
   }
 }
 
@@ -123,6 +155,33 @@ export async function clearAllTables(): Promise<void> {
       db.workOrders.clear()
     ])
   })
+}
+
+/**
+ * 缺陷删除后的作业单同步：把缺陷从所含作业单中剔除，
+ * 作业单被掏空时一并删除（删除缺陷 / 分段 / 叶片 / 机组的级联共用）。
+ * 需在包含 db.workOrders 的事务内调用。
+ */
+export async function detachDefectsFromOrders(defectIds: string[]): Promise<void> {
+  if (defectIds.length === 0) return
+  const gone = new Set(defectIds)
+  const affected = await db.workOrders
+    .filter((order) => defectIdsOf(order).some((id) => gone.has(id)))
+    .toArray()
+  const emptied: string[] = []
+  const updated: WorkOrder[] = []
+  affected.forEach((order) => {
+    const rest = defectIdsOf(order).filter((id) => !gone.has(id))
+    if (rest.length === 0) {
+      emptied.push(order.id)
+      return
+    }
+    const next: WorkOrder = { ...order, defectIds: rest, updatedAt: Date.now() }
+    delete next.defectId
+    updated.push(next)
+  })
+  if (updated.length > 0) await db.workOrders.bulkPut(updated)
+  if (emptied.length > 0) await db.workOrders.bulkDelete(emptied)
 }
 
 /** 读取 localStorage 中的 UI 偏好 */
@@ -177,7 +236,17 @@ export function round2(value: number): number {
   return Math.round(value * 100) / 100
 }
 
-/** 播种用的缺陷规格：order 存在时按工单状态反推缺陷状态 */
+/** 播种用的作业单规格：一张作业单覆盖同叶片、同班组、同限期的多条缺陷 */
+interface SeedOrderSpec {
+  key: string
+  team: string
+  dueOffsetDays: number
+  state: WorkOrderState
+  acceptor: string
+  closedOffsetDays: number | null
+}
+
+/** 播种用的缺陷规格：orderKey 存在时挂到对应作业单，并按作业单状态反推缺陷状态 */
 interface SeedDefectSpec {
   turbine: 0 | 1
   serial: BladeSerial
@@ -187,44 +256,56 @@ interface SeedDefectSpec {
   lengthMm: number
   widthMm: number
   foundOffsetDays: number
-  order?: {
-    team: string
-    dueOffsetDays: number
-    state: WorkOrderState
-    acceptor: string
-    closedOffsetDays: number | null
-  }
+  orderKey?: string
+  /** 已登记的修复结果（待复验 / 已闭环作业单内的缺陷应登记） */
+  repairResult?: string
+  repairedOffsetDays?: number
 }
 
-/** 演示数据：2 台机组 × 各 2 片叶片 × 各 3 个展向分段 × 18 条缺陷 × 4 张工单 */
+/** 演示作业单：5 张，覆盖 7 条缺陷 */
+const SEED_ORDERS: SeedOrderSpec[] = [
+  { key: 'o1', team: '叶片检修一班', dueOffsetDays: -12, state: '处理中', acceptor: '', closedOffsetDays: null },
+  { key: 'o2', team: '无人机巡检组', dueOffsetDays: 26, state: '待派', acceptor: '', closedOffsetDays: null },
+  { key: 'o3', team: '复材修复三班', dueOffsetDays: 4, state: '待复验', acceptor: '', closedOffsetDays: null },
+  { key: 'o4', team: '高空作业二班', dueOffsetDays: -40, state: '已闭环', acceptor: '赵鹏', closedOffsetDays: -35 },
+  { key: 'o5', team: '复材修复三班', dueOffsetDays: 9, state: '处理中', acceptor: '', closedOffsetDays: null }
+]
+
+/** 演示数据：2 台机组 × 各 2 片叶片 × 各 3 个展向分段 × 18 条缺陷 × 5 张作业单 */
 const SEED_DEFECTS: SeedDefectSpec[] = [
   // ---- 机组一 WT-A01 ----
   {
     turbine: 0, serial: 'A', seg: 1, type: '前缘腐蚀', severity: '中度',
     lengthMm: 820, widthMm: 36, foundOffsetDays: -46,
-    order: { team: '叶片检修一班', dueOffsetDays: -12, state: '处理中', acceptor: '', closedOffsetDays: null }
+    orderKey: 'o1', repairResult: '腐蚀区打磨后补涂胶衣，表面已找平', repairedOffsetDays: -3
   },
-  { turbine: 0, serial: 'A', seg: 1, type: '砂眼', severity: '轻度', lengthMm: 12, widthMm: 9, foundOffsetDays: -46 },
+  {
+    turbine: 0, serial: 'A', seg: 1, type: '砂眼', severity: '轻度',
+    lengthMm: 12, widthMm: 9, foundOffsetDays: -46, orderKey: 'o1'
+  },
   { turbine: 0, serial: 'A', seg: 2, type: '裂纹', severity: '重度', lengthMm: 1450, widthMm: 6, foundOffsetDays: -30 },
   { turbine: 0, serial: 'A', seg: 2, type: '油污', severity: '轻度', lengthMm: 340, widthMm: 210, foundOffsetDays: -30 },
   { turbine: 0, serial: 'A', seg: 3, type: '雷击', severity: '重度', lengthMm: 260, widthMm: 180, foundOffsetDays: -18 },
   {
     turbine: 0, serial: 'B', seg: 1, type: '油污', severity: '轻度',
-    lengthMm: 260, widthMm: 140, foundOffsetDays: -52,
-    order: { team: '无人机巡检组', dueOffsetDays: 26, state: '待派', acceptor: '', closedOffsetDays: null }
+    lengthMm: 260, widthMm: 140, foundOffsetDays: -52, orderKey: 'o2'
   },
-  { turbine: 0, serial: 'B', seg: 2, type: '裂纹', severity: '重度', lengthMm: 1180, widthMm: 5, foundOffsetDays: -25 },
+  {
+    turbine: 0, serial: 'B', seg: 2, type: '裂纹', severity: '重度',
+    lengthMm: 1180, widthMm: 5, foundOffsetDays: -25,
+    orderKey: 'o3', repairResult: '裂纹开槽灌注结构胶，打磨找平', repairedOffsetDays: -2
+  },
   {
     turbine: 0, serial: 'B', seg: 2, type: '前缘腐蚀', severity: '中度',
     lengthMm: 640, widthMm: 28, foundOffsetDays: -25,
-    order: { team: '复材修复三班', dueOffsetDays: 4, state: '待验收', acceptor: '', closedOffsetDays: null }
+    orderKey: 'o3', repairResult: '腐蚀区打磨后重做前缘防护涂层', repairedOffsetDays: -2
   },
   { turbine: 0, serial: 'B', seg: 3, type: '砂眼', severity: '中度', lengthMm: 18, widthMm: 14, foundOffsetDays: -11 },
   // ---- 机组二 WT-B07 ----
   {
     turbine: 1, serial: 'A', seg: 1, type: '雷击', severity: '重度',
     lengthMm: 310, widthMm: 220, foundOffsetDays: -64,
-    order: { team: '高空作业二班', dueOffsetDays: -40, state: '已闭环', acceptor: '赵鹏', closedOffsetDays: -35 }
+    orderKey: 'o4', repairResult: '雷击烧蚀区铺层修复，复测合格', repairedOffsetDays: -36
   },
   { turbine: 1, serial: 'A', seg: 2, type: '前缘腐蚀', severity: '中度', lengthMm: 910, widthMm: 42, foundOffsetDays: -33 },
   { turbine: 1, serial: 'A', seg: 3, type: '裂纹', severity: '轻度', lengthMm: 420, widthMm: 3, foundOffsetDays: -20 },
@@ -232,8 +313,7 @@ const SEED_DEFECTS: SeedDefectSpec[] = [
   { turbine: 1, serial: 'B', seg: 1, type: '砂眼', severity: '轻度', lengthMm: 15, widthMm: 11, foundOffsetDays: -58 },
   {
     turbine: 1, serial: 'B', seg: 2, type: '裂纹', severity: '重度',
-    lengthMm: 1620, widthMm: 8, foundOffsetDays: -27,
-    order: { team: '复材修复三班', dueOffsetDays: 9, state: '处理中', acceptor: '', closedOffsetDays: null }
+    lengthMm: 1620, widthMm: 8, foundOffsetDays: -27, orderKey: 'o5'
   },
   { turbine: 1, serial: 'B', seg: 2, type: '雷击', severity: '中度', lengthMm: 150, widthMm: 96, foundOffsetDays: -27 },
   { turbine: 1, serial: 'B', seg: 3, type: '前缘腐蚀', severity: '重度', lengthMm: 1720, widthMm: 55, foundOffsetDays: -14 },
@@ -246,7 +326,7 @@ export async function isSeeded(): Promise<boolean> {
 }
 
 /**
- * 首次进入自动播种演示数据：2 台机组 × 各 2 片叶片 × 各 3 个展向分段 × 18 条缺陷 × 4 张工单。
+ * 首次进入自动播种演示数据：2 台机组 × 各 2 片叶片 × 各 3 个展向分段 × 18 条缺陷 × 5 张作业单。
  * 幂等：机组表非空时直接返回 false，不会重复播种。
  */
 export async function seedDemoData(): Promise<boolean> {
@@ -258,6 +338,9 @@ export async function seedDemoData(): Promise<boolean> {
   const segments: Segment[] = []
   const defects: Defect[] = []
   const workOrders: WorkOrder[] = []
+  const orderSpecMap = new Map(SEED_ORDERS.map((spec) => [spec.key, spec]))
+  /** 作业单 key → 所含缺陷 id，随缺陷生成逐步收集 */
+  const orderDefectIds = new Map<string, string[]>()
 
   const blueprints: Array<{
     code: string
@@ -350,8 +433,9 @@ export async function seedDemoData(): Promise<boolean> {
         )
         specs.forEach((spec, specIndex) => {
           const defectId = createId('dfc')
-          const state: DefectState = spec.order
-            ? spec.order.state === '已闭环'
+          const orderSpec = spec.orderKey ? orderSpecMap.get(spec.orderKey) : undefined
+          const state: DefectState = orderSpec
+            ? orderSpec.state === '已闭环'
               ? '已修复'
               : '已派工'
             : '待处理'
@@ -369,28 +453,41 @@ export async function seedDemoData(): Promise<boolean> {
             positionM,
             foundAt: dateOffset(spec.foundOffsetDays),
             state,
+            repairResult: spec.repairResult ?? '',
+            repairedAt: spec.repairResult
+              ? now + (spec.repairedOffsetDays ?? 0) * 24 * 60 * 60 * 1000
+              : null,
             createdAt: now,
             updatedAt: now
           })
 
-          if (spec.order) {
-            workOrders.push({
-              id: createId('wo'),
-              defectId,
-              team: spec.order.team,
-              dueDate: dateOffset(spec.order.dueOffsetDays),
-              state: spec.order.state,
-              acceptor: spec.order.acceptor,
-              closedAt:
-                spec.order.closedOffsetDays === null
-                  ? null
-                  : now + spec.order.closedOffsetDays * 24 * 60 * 60 * 1000,
-              createdAt: now,
-              updatedAt: now
-            })
+          if (spec.orderKey) {
+            const list = orderDefectIds.get(spec.orderKey) ?? []
+            list.push(defectId)
+            orderDefectIds.set(spec.orderKey, list)
           }
         })
       }
+    })
+  })
+
+  // 按作业单规格汇总所含缺陷，一次派工覆盖同叶片多条缺陷
+  SEED_ORDERS.forEach((orderSpec) => {
+    const defectIds = orderDefectIds.get(orderSpec.key) ?? []
+    if (defectIds.length === 0) return
+    workOrders.push({
+      id: createId('wo'),
+      defectIds,
+      team: orderSpec.team,
+      dueDate: dateOffset(orderSpec.dueOffsetDays),
+      state: orderSpec.state,
+      acceptor: orderSpec.acceptor,
+      closedAt:
+        orderSpec.closedOffsetDays === null
+          ? null
+          : now + orderSpec.closedOffsetDays * 24 * 60 * 60 * 1000,
+      createdAt: now,
+      updatedAt: now
     })
   })
 

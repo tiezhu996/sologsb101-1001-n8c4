@@ -50,7 +50,7 @@ export const WORK_ORDER_STATE_TAG_TYPE: Record<
 > = {
   待派: 'info',
   处理中: 'warning',
-  待验收: 'primary',
+  待复验: 'primary',
   已闭环: 'success'
 }
 

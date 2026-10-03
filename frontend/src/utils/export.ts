@@ -6,6 +6,8 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import { normalizeDefect } from '@/types/defect'
+import { normalizeWorkOrder } from '@/types/workOrder'
 import { reportFileName, type TurbineReport } from '@/utils/report'
 
 const COLLECTIONS = ['turbines', 'blades', 'segments', 'defects', 'workOrders'] as const
@@ -36,8 +38,9 @@ export function validateBackup(input: unknown): {
     turbines: obj.turbines ?? [],
     blades: obj.blades ?? [],
     segments: obj.segments ?? [],
-    defects: obj.defects ?? [],
-    workOrders: obj.workOrders ?? []
+    // 旧版备份（一条缺陷一张工单、无修复结果字段）按兼容方式归一化读入
+    defects: (obj.defects ?? []).map((defect) => normalizeDefect(defect)),
+    workOrders: (obj.workOrders ?? []).map((order) => normalizeWorkOrder(order))
   }
   return { ok: true, errors, payload }
 }
@@ -163,7 +166,7 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const workOrders = payload.workOrders.map((order) => ({
     ...order,
     id: createId('wo'),
-    defectId: defectIdMap.get(order.defectId) ?? order.defectId
+    defectIds: order.defectIds.map((defectId) => defectIdMap.get(defectId) ?? defectId)
   }))
 
   return { ...payload, turbines, blades, segments, defects, workOrders }

@@ -1,7 +1,16 @@
 import type { Blade } from '@/types/blade'
 import type { Segment } from '@/types/segment'
-import { DEFECT_STATES, DEFECT_TYPES, SEVERITIES, type Defect, type DefectState, type DefectType, type Severity } from '@/types/defect'
-import { WORK_ORDER_STATES, isOverdue, type WorkOrder, type WorkOrderState } from '@/types/workOrder'
+import {
+  DEFECT_STATES,
+  DEFECT_TYPES,
+  SEVERITIES,
+  hasRepairResult,
+  type Defect,
+  type DefectState,
+  type DefectType,
+  type Severity
+} from '@/types/defect'
+import { WORK_ORDER_STATES, defectIdsOf, isOverdue, type WorkOrder, type WorkOrderState } from '@/types/workOrder'
 import { defectAreaCm2, percentOf, SEVERITY_WEIGHT } from '@/utils/severity'
 
 /** 报告页 / 导出文件里的一行分布统计 */
@@ -31,13 +40,20 @@ export interface ReportBladeSection {
   areaCm2: number
 }
 
-/** 报告中的工单行（带缺陷定位信息） */
+/** 报告中作业单内的一条缺陷（保证每条缺陷都在报告中出现） */
+export interface ReportWorkOrderDefect {
+  defect: Defect
+  segmentIndex: number
+  repairRegistered: boolean
+}
+
+/** 报告中的作业单行：一张作业单 + 所含全部缺陷 */
 export interface ReportWorkOrderLine {
   order: WorkOrder
-  defectType: DefectType
-  severity: Severity
   bladeSerial: string
-  segmentIndex: number
+  defects: ReportWorkOrderDefect[]
+  /** 已登记修复结果的缺陷数 */
+  registeredCount: number
   overdue: boolean
 }
 
@@ -67,6 +83,10 @@ export interface TurbineReport {
     areaCm2: number
     workOrderCount: number
     overdueCount: number
+    /** 作业单覆盖的缺陷条数 */
+    orderDefectCount: number
+    /** 未闭环作业单中尚未登记修复结果的缺陷条数（跟催重点） */
+    repairPendingCount: number
     riskScore: number
   }
   severityDist: ReportDistributionRow[]
@@ -150,28 +170,39 @@ export function buildTurbineReport(
   const defectById = new Map(source.defects.map((defect) => [defect.id, defect]))
   const today = generatedAt.slice(0, 10)
 
+  // 作业单逐条展开所含缺陷：只保留属于本机组叶片的缺陷，单内无本机组缺陷的整单略过
   const workOrders: ReportWorkOrderLine[] = source.workOrders
-    .filter((order) => defectById.has(order.defectId))
-    .filter((order) => {
-      const defect = defectById.get(order.defectId) as Defect
-      const segment = defectToSegment.get(defect.segmentId)
-      const blade = segment ? bladeById.get(segment.bladeId) : undefined
-      return blade !== undefined
-    })
-    .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
     .map((order) => {
-      const defect = defectById.get(order.defectId) as Defect
-      const segment = defectToSegment.get(defect.segmentId) as Segment
-      const blade = bladeById.get(segment.bladeId) as Blade
+      const items: ReportWorkOrderDefect[] = []
+      let bladeSerial = ''
+      defectIdsOf(order).forEach((defectId) => {
+        const defect = defectById.get(defectId)
+        if (!defect) return
+        const segment = defectToSegment.get(defect.segmentId)
+        if (!segment) return
+        const blade = bladeById.get(segment.bladeId)
+        if (!blade) return
+        if (bladeSerial === '') bladeSerial = blade.serial
+        items.push({
+          defect,
+          segmentIndex: segment.index,
+          repairRegistered: hasRepairResult(defect)
+        })
+      })
+      if (items.length === 0) return null
+      items.sort(
+        (a, b) => a.segmentIndex - b.segmentIndex || a.defect.positionM - b.defect.positionM
+      )
       return {
         order,
-        defectType: defect.type,
-        severity: defect.severity,
-        bladeSerial: blade.serial,
-        segmentIndex: segment.index,
+        bladeSerial,
+        defects: items,
+        registeredCount: items.filter((item) => item.repairRegistered).length,
         overdue: isOverdue(order, today)
       }
     })
+    .filter((line): line is ReportWorkOrderLine => line !== null)
+    .sort((a, b) => a.order.dueDate.localeCompare(b.order.dueDate))
 
   const closedCount = defects.filter((defect) => defect.state === '已修复').length
   const riskScore = defects.reduce((sum, defect) => sum + SEVERITY_WEIGHT[defect.severity], 0)
@@ -194,6 +225,10 @@ export function buildTurbineReport(
       areaCm2,
       workOrderCount: workOrders.length,
       overdueCount: workOrders.filter((line) => line.overdue).length,
+      orderDefectCount: workOrders.reduce((sum, line) => sum + line.defects.length, 0),
+      repairPendingCount: workOrders
+        .filter((line) => line.order.state !== '已闭环')
+        .reduce((sum, line) => sum + (line.defects.length - line.registeredCount), 0),
       riskScore
     },
     severityDist: distribution(SEVERITIES as string[], severityCounts, defects.length),
@@ -235,7 +270,7 @@ export function reportToText(report: TurbineReport): string {
     `  未闭环 ${report.summary.openCount} 条｜已修复 ${report.summary.closedCount} 条｜重度 ${report.summary.heavyCount} 条（${report.summary.heavyPercent}%）`
   )
   lines.push(
-    `  损伤面积 ${report.summary.areaCm2} cm²｜工单 ${report.summary.workOrderCount} 张（超期 ${report.summary.overdueCount} 张）｜风险分 ${report.summary.riskScore}`
+    `  损伤面积 ${report.summary.areaCm2} cm²｜作业单 ${report.summary.workOrderCount} 张（超期 ${report.summary.overdueCount} 张，覆盖缺陷 ${report.summary.orderDefectCount} 条，待登记修复结果 ${report.summary.repairPendingCount} 条）｜风险分 ${report.summary.riskScore}`
   )
   lines.push('')
   lines.push('二、严重程度分布')
@@ -264,16 +299,23 @@ export function reportToText(report: TurbineReport): string {
     })
   })
   lines.push('')
-  lines.push('六、维修工单')
+  lines.push('六、维修作业单')
   if (report.workOrders.length === 0) {
-    lines.push('  （暂无工单）')
+    lines.push('  （暂无作业单）')
   }
   report.workOrders.forEach((line) => {
     lines.push(
-      `  #${line.order.id.slice(-6)} 叶片 ${line.bladeSerial} 第 ${line.segmentIndex} 段｜${line.defectType}（${line.severity}）｜${line.order.team}｜限期 ${line.order.dueDate}｜${line.order.state}${
+      `  #${line.order.id.slice(-6)} 叶片 ${line.bladeSerial}｜${line.order.team}｜限期 ${line.order.dueDate}｜${line.order.state}${
         line.overdue ? '（已超期）' : ''
-      }｜验收人 ${line.order.acceptor || '—'}`
+      }｜验收人 ${line.order.acceptor || '—'}｜修复结果 ${line.registeredCount}/${line.defects.length}`
     )
+    line.defects.forEach((item) => {
+      lines.push(
+        `    · 第 ${item.segmentIndex} 段 ${item.defect.type}（${item.defect.severity}）${item.defect.lengthMm}×${item.defect.widthMm} mm｜${item.defect.positionM} m｜${
+          item.repairRegistered ? `已登记：${item.defect.repairResult}` : '待复验（未登记修复结果）'
+        }`
+      )
+    })
   })
   return lines.join('\n')
 }

@@ -1,12 +1,16 @@
-/** 工单状态流转：待派 → 处理中 → 待验收 → 已闭环 */
-export type WorkOrderState = '待派' | '处理中' | '待验收' | '已闭环'
+/** 工单状态流转：待派 → 处理中 → 待复验 → 已闭环 */
+export type WorkOrderState = '待派' | '处理中' | '待复验' | '已闭环'
 
 /**
- * 维修工单：针对一条缺陷派发的检修任务，验收通过后回写缺陷为已修复。
+ * 维修作业单：一次高空检修派工，覆盖同一叶片、同一班组、同一限期下的多条缺陷。
+ * 所含缺陷全部登记修复结果后才能验收闭环；撤回验收时整单缺陷一起回到「已派工」。
  */
 export interface WorkOrder {
   id: string
-  defectId: string
+  /** 所含缺陷 id 列表（同叶片、同班组、同限期） */
+  defectIds: string[]
+  /** 旧版单缺陷字段：仅用于兼容读入 v3 之前的数据，新数据不再写入 */
+  defectId?: string
   /** 派工班组 */
   team: string
   /** 限期 YYYY-MM-DD */
@@ -21,25 +25,49 @@ export interface WorkOrder {
 }
 
 export const WORK_TEAMS: string[] = ['叶片检修一班', '高空作业二班', '复材修复三班', '无人机巡检组']
-export const WORK_ORDER_STATES: WorkOrderState[] = ['待派', '处理中', '待验收', '已闭环']
+export const WORK_ORDER_STATES: WorkOrderState[] = ['待派', '处理中', '待复验', '已闭环']
 
 /** 状态机：每个状态的下一状态，已闭环没有下一状态 */
 export const WORK_ORDER_FLOW: Record<WorkOrderState, WorkOrderState | null> = {
   待派: '处理中',
-  处理中: '待验收',
-  待验收: '已闭环',
+  处理中: '待复验',
+  待复验: '已闭环',
   已闭环: null
 }
 
 export const WORK_ORDER_STATE_COLOR: Record<WorkOrderState, string> = {
   待派: '#8c8479',
   处理中: '#d68910',
-  待验收: '#4a6fa5',
+  待复验: '#4a6fa5',
   已闭环: '#1e8449'
 }
 
 export function nextWorkOrderState(state: WorkOrderState): WorkOrderState | null {
   return WORK_ORDER_FLOW[state]
+}
+
+/** 旧版状态名 → 现状态名（v3 起「待验收」改称「待复验」） */
+const LEGACY_STATE_MAP: Record<string, WorkOrderState> = {
+  待验收: '待复验'
+}
+
+/** 兼容读取作业单所含缺陷：新数据取 defectIds，旧数据回退到单条 defectId */
+export function defectIdsOf(order: Pick<WorkOrder, 'defectIds' | 'defectId'>): string[] {
+  if (Array.isArray(order.defectIds) && order.defectIds.length > 0) return order.defectIds
+  if (typeof order.defectId === 'string' && order.defectId.length > 0) return [order.defectId]
+  return []
+}
+
+/**
+ * 归一化历史工单记录（IndexedDB 升级与 JSON 导入共用）：
+ * 单缺陷 defectId → defectIds；旧状态名「待验收」→「待复验」。
+ */
+export function normalizeWorkOrder(raw: WorkOrder): WorkOrder {
+  const defectIds = defectIdsOf(raw)
+  const state = LEGACY_STATE_MAP[raw.state as string] ?? raw.state
+  const normalized: WorkOrder = { ...raw, defectIds, state }
+  delete normalized.defectId
+  return normalized
 }
 
 /** 工单统计汇总，维修工单页与报告页直接消费 */

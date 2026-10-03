@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
-import { db } from '@/utils/db'
+import { db, detachDefectsFromOrders } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   createEmptyDefectFilter,
@@ -13,7 +13,7 @@ import {
 import type { Segment } from '@/types/segment'
 import type { Blade } from '@/types/blade'
 import type { Turbine } from '@/types/turbine'
-import type { WorkOrder } from '@/types/workOrder'
+import { defectIdsOf, type WorkOrder } from '@/types/workOrder'
 import { compareSeverity, defectAreaCm2, percentOf } from '@/utils/severity'
 
 /** 缺陷标注台的一行：缺陷 + 所属分段 + 叶片 + 机组 */
@@ -196,7 +196,7 @@ export const useDefectStore = defineStore('defect', () => {
   }
 
   function ordersOfDefect(defectId: string): WorkOrder[] {
-    return workOrders.value.filter((order) => order.defectId === defectId)
+    return workOrders.value.filter((order) => defectIdsOf(order).includes(defectId))
   }
 
   function toggleSelection(id: string): void {
@@ -218,18 +218,29 @@ export const useDefectStore = defineStore('defect', () => {
     return selectedIds.has(id)
   }
 
-  async function createDefect(payload: Omit<Defect, 'id' | 'createdAt' | 'updatedAt'>): Promise<Defect> {
-    return defectsTable.create(payload, 'dfc')
+  /** 新建缺陷入参：修复结果登记字段由 store 补默认值（未派工的缺陷尚未产生修复结果） */
+  async function createDefect(
+    payload: Omit<Defect, 'id' | 'createdAt' | 'updatedAt' | 'repairResult' | 'repairedAt'> &
+      Partial<Pick<Defect, 'repairResult' | 'repairedAt'>>
+  ): Promise<Defect> {
+    return defectsTable.create(
+      {
+        ...payload,
+        repairResult: payload.repairResult ?? '',
+        repairedAt: payload.repairedAt ?? null
+      },
+      'dfc'
+    )
   }
 
   async function updateDefect(id: string, patch: Partial<Defect>): Promise<void> {
     await defectsTable.update(id, patch)
   }
 
-  /** 级联删除缺陷及其维修工单 */
+  /** 级联删除缺陷：从所含作业单中剔除（作业单被掏空时一并删除） */
   async function removeDefect(id: string): Promise<void> {
     await db.transaction('rw', [db.defects, db.workOrders], async () => {
-      await db.workOrders.where('defectId').equals(id).delete()
+      await detachDefectsFromOrders([id])
       await db.defects.delete(id)
     })
     selectedIds.delete(id)
@@ -238,7 +249,7 @@ export const useDefectStore = defineStore('defect', () => {
   async function removeDefects(ids: string[]): Promise<number> {
     if (ids.length === 0) return 0
     await db.transaction('rw', [db.defects, db.workOrders], async () => {
-      await db.workOrders.where('defectId').anyOf(ids).delete()
+      await detachDefectsFromOrders(ids)
       await db.defects.bulkDelete(ids)
     })
     ids.forEach((id) => selectedIds.delete(id))

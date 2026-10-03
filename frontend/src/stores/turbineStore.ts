@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
-import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
+import { db, detachDefectsFromOrders, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   DEFAULT_BLADE_COUNT,
@@ -17,7 +17,7 @@ import {
 } from '@/types/blade'
 import type { Segment } from '@/types/segment'
 import type { Defect } from '@/types/defect'
-import type { WorkOrder } from '@/types/workOrder'
+import { defectIdsOf, type WorkOrder } from '@/types/workOrder'
 import { percentOf } from '@/utils/severity'
 
 /** 新建机组的入参：除机组本体外，同时给出派生叶片所需的默认参数 */
@@ -102,7 +102,7 @@ export const useTurbineStore = defineStore('turbine', () => {
 
   function workOrdersOfTurbine(turbineId: string): WorkOrder[] {
     const defectIds = new Set(defectsOfTurbine(turbineId).map((defect) => defect.id))
-    return workOrders.value.filter((order) => defectIds.has(order.defectId))
+    return workOrders.value.filter((order) => defectIdsOf(order).some((id) => defectIds.has(id)))
   }
 
   /** 机组卡片回显的缺陷总数与未闭环数 */
@@ -279,7 +279,7 @@ export const useTurbineStore = defineStore('turbine', () => {
     await bladesTable.update(id, patch)
   }
 
-  /** 级联删除叶片：分段 → 缺陷 → 工单 */
+  /** 级联删除叶片：分段 → 缺陷（同步作业单） */
   async function removeBlade(id: string): Promise<void> {
     const blade = bladeById(id)
     const segmentIds = segments.value.filter((segment) => segment.bladeId === id).map((segment) => segment.id)
@@ -290,7 +290,7 @@ export const useTurbineStore = defineStore('turbine', () => {
       'rw',
       [db.blades, db.segments, db.defects, db.workOrders],
       async () => {
-        await db.workOrders.where('defectId').anyOf(defectIds).delete()
+        await detachDefectsFromOrders(defectIds)
         await db.defects.bulkDelete(defectIds)
         await db.segments.bulkDelete(segmentIds)
         await db.blades.delete(id)
@@ -302,7 +302,7 @@ export const useTurbineStore = defineStore('turbine', () => {
     }
   }
 
-  /** 级联删除机组：叶片 → 分段 → 缺陷 → 工单 */
+  /** 级联删除机组：叶片 → 分段 → 缺陷（同步作业单） */
   async function removeTurbine(id: string): Promise<void> {
     const bladeIds = bladesOfTurbine(id).map((blade) => blade.id)
     const segmentIds = segments.value
@@ -315,7 +315,7 @@ export const useTurbineStore = defineStore('turbine', () => {
       'rw',
       [db.turbines, db.blades, db.segments, db.defects, db.workOrders],
       async () => {
-        await db.workOrders.where('defectId').anyOf(defectIds).delete()
+        await detachDefectsFromOrders(defectIds)
         await db.defects.bulkDelete(defectIds)
         await db.segments.bulkDelete(segmentIds)
         await db.blades.bulkDelete(bladeIds)

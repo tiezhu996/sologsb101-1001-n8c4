@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
-import { db, readUiPrefs, round2, writeUiPrefs } from '@/utils/db'
+import { db, detachDefectsFromOrders, readUiPrefs, round2, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import type { Blade, BladeStat } from '@/types/blade'
 import type { Segment, SegmentGenerateOptions, SegmentStat } from '@/types/segment'
@@ -121,7 +121,7 @@ export const useBladeStore = defineStore('blade', () => {
     currentBladeId.value = id
   }
 
-  /** 级联删除某叶片的全部展向分段（含缺陷与工单），返回删除的分段数 */
+  /** 级联删除某叶片的全部展向分段（含缺陷，同步作业单），返回删除的分段数 */
   async function removeSegmentsOfBlade(bladeId: string): Promise<number> {
     const segmentIds = segmentsOfBlade(bladeId).map((segment) => segment.id)
     if (segmentIds.length === 0) return 0
@@ -129,7 +129,7 @@ export const useBladeStore = defineStore('blade', () => {
       .filter((defect) => segmentIds.includes(defect.segmentId))
       .map((defect) => defect.id)
     await db.transaction('rw', [db.segments, db.defects, db.workOrders], async () => {
-      await db.workOrders.where('defectId').anyOf(defectIds).delete()
+      await detachDefectsFromOrders(defectIds)
       await db.defects.bulkDelete(defectIds)
       await db.segments.bulkDelete(segmentIds)
     })
@@ -201,12 +201,12 @@ export const useBladeStore = defineStore('blade', () => {
     await segmentsTable.update(id, { sectionImage: '', sectionPreview: '' })
   }
 
-  /** 级联删除分段：缺陷 → 工单 → 分段，并回写叶片段数 */
+  /** 级联删除分段：缺陷（同步作业单）→ 分段，并回写叶片段数 */
   async function removeSegment(id: string): Promise<void> {
     const segment = segments.value.find((item) => item.id === id)
     const defectIds = defectsOfSegment(id).map((defect) => defect.id)
     await db.transaction('rw', [db.segments, db.defects, db.workOrders], async () => {
-      await db.workOrders.where('defectId').anyOf(defectIds).delete()
+      await detachDefectsFromOrders(defectIds)
       await db.defects.bulkDelete(defectIds)
       await db.segments.delete(id)
     })

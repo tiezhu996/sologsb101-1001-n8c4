@@ -313,7 +313,8 @@ watch(bladePanels, (panels) => {
             icon="SuccessFilled"
           />
           <StatBadge label="损伤面积" :value="formatArea(report.summary.areaCm2)" tone="warning" icon="Odometer" />
-          <StatBadge label="工单 / 超期" :value="`${report.summary.workOrderCount} / ${report.summary.overdueCount}`" tone="info" icon="Files" />
+          <StatBadge label="作业单 / 超期" :value="`${report.summary.workOrderCount} / ${report.summary.overdueCount}`" tone="info" icon="Files" />
+          <StatBadge label="待登记修复结果" :value="report.summary.repairPendingCount" suffix="条" tone="danger" icon="Document" />
         </div>
 
         <div class="section-card">
@@ -455,25 +456,36 @@ watch(bladePanels, (panels) => {
 
         <div class="section-card">
           <div class="section-card__head">
-            <h3>维修工单跟踪</h3>
+            <h3>维修作业单跟踪</h3>
             <span class="muted">共 {{ report.workOrders.length }} 张</span>
           </div>
           <el-table :data="report.workOrders" size="small" border>
-            <el-table-column label="工单号" width="120">
+            <el-table-column label="作业单号" width="110">
               <template #default="{ row }">
                 <span class="mono">#{{ row.order.id.slice(-6) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="定位" min-width="180">
+            <el-table-column label="叶片" width="70">
+              <template #default="{ row }">{{ row.bladeSerial }}</template>
+            </el-table-column>
+            <el-table-column label="所含缺陷（逐条跟踪，不漏项）" min-width="300">
               <template #default="{ row }">
-                叶片 {{ row.bladeSerial }}｜第 {{ row.segmentIndex }} 段
+                <div class="cell-stack">
+                  <div v-for="item in row.defects" :key="item.defect.id" class="order-defect-line">
+                    <span>
+                      第 {{ item.segmentIndex }} 段 · {{ item.defect.type }}（{{ item.defect.severity }}）·
+                      {{ item.defect.positionM }} m
+                    </span>
+                    <el-tag v-if="item.repairRegistered" size="small" type="success" effect="plain">
+                      已登记
+                    </el-tag>
+                    <el-tag v-else size="small" type="warning" effect="plain">待复验</el-tag>
+                  </div>
+                </div>
               </template>
             </el-table-column>
-            <el-table-column label="缺陷" min-width="150">
-              <template #default="{ row }">{{ row.defectType }}（{{ row.severity }}）</template>
-            </el-table-column>
-            <el-table-column label="班组" prop="order.team" width="140" />
-            <el-table-column label="限期" width="130">
+            <el-table-column label="班组" prop="order.team" width="130" />
+            <el-table-column label="限期" width="120">
               <template #default="{ row }">
                 <span class="mono">{{ row.order.dueDate }}</span>
               </template>
@@ -484,11 +496,14 @@ watch(bladePanels, (panels) => {
                 <el-tag v-if="row.overdue" size="small" type="danger" effect="dark">超期</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="验收人" width="110">
+            <el-table-column label="修复结果" width="100">
+              <template #default="{ row }">{{ row.registeredCount }} / {{ row.defects.length }}</template>
+            </el-table-column>
+            <el-table-column label="验收人" width="100">
               <template #default="{ row }">{{ row.order.acceptor || '—' }}</template>
             </el-table-column>
             <template #empty>
-              <span class="muted">该机组暂无维修工单</span>
+              <span class="muted">该机组暂无维修作业单</span>
             </template>
           </el-table>
         </div>
@@ -599,6 +614,20 @@ watch(bladePanels, (panels) => {
   align-items: center;
   gap: 10px;
   font-size: 13px;
+}
+
+.cell-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 13px;
+}
+
+.order-defect-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
 }
 
 .defect-subtable {

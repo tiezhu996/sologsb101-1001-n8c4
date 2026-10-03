@@ -27,6 +27,10 @@ export interface Defect {
   /** 发现日期 YYYY-MM-DD */
   foundAt: string
   state: DefectState
+  /** 修复结果登记内容，空串表示尚未登记（待复验） */
+  repairResult: string
+  /** 修复结果登记时间戳，未登记为 null */
+  repairedAt: number | null
   createdAt: number
   updatedAt: number
 }
@@ -80,4 +84,21 @@ export function createEmptyDefectFilter(): DefectFilterState {
 /** 缺陷尺寸文案：1200 × 35 mm */
 export function formatDefectSize(lengthMm: number, widthMm: number): string {
   return `${lengthMm} × ${widthMm} mm`
+}
+
+/** 是否已登记修复结果（兼容旧数据：字段缺失视为未登记） */
+export function hasRepairResult(defect: Pick<Defect, 'repairResult'>): boolean {
+  return typeof defect.repairResult === 'string' && defect.repairResult.trim().length > 0
+}
+
+/**
+ * 归一化历史缺陷记录（IndexedDB 升级与 JSON 导入共用）：
+ * 补齐 v3 新增的修复结果字段，避免页面读取到 undefined。
+ */
+export function normalizeDefect(raw: Defect): Defect {
+  return {
+    ...raw,
+    repairResult: typeof raw.repairResult === 'string' ? raw.repairResult : '',
+    repairedAt: typeof raw.repairedAt === 'number' ? raw.repairedAt : null
+  }
 }

@@ -20,6 +20,7 @@ import {
   DEFECT_STATES,
   DEFECT_TYPES,
   SEVERITIES,
+  hasRepairResult,
   type Defect,
   type DefectState,
   type DefectType,
@@ -160,7 +161,7 @@ async function removeSelected(): Promise<void> {
   if (selectedIds.value.length === 0) return
   try {
     await ElMessageBox.confirm(
-      `确认删除选中的 ${selectedIds.value.length} 条缺陷？其关联工单会一并删除。`,
+      `确认删除选中的 ${selectedIds.value.length} 条缺陷？关联作业单会同步剔除这些缺陷（作业单被掏空时一并撤掉）。`,
       '批量删除确认',
       { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
     )
@@ -323,7 +324,7 @@ async function removeDefect(row: DefectRow): Promise<void> {
   try {
     await ElMessageBox.confirm(
       `确认删除这条 ${row.defect.type}（${row.defect.severity}）缺陷？${
-        orders.length > 0 ? `关联的 ${orders.length} 张工单会一并删除。` : ''
+        orders.length > 0 ? '关联作业单会同步剔除该缺陷（作业单被掏空时一并撤掉）。' : ''
       }`,
       '删除缺陷确认',
       { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
@@ -363,7 +364,7 @@ async function submitDispatch(): Promise<void> {
   if (dispatchTargets.value.length === 0) return
   dispatchSubmitting.value = true
   try {
-    let created = 0
+    const freshIds: string[] = []
     let reassigned = 0
     for (const row of dispatchTargets.value) {
       const existing = workOrderStore.ordersOfDefect(row.defect.id)[0]
@@ -372,20 +373,18 @@ async function submitDispatch(): Promise<void> {
           team: dispatchForm.team,
           dueDate: dispatchForm.dueDate
         })
-        if (row.defect.state === '待处理') await defectStore.setState(row.defect.id, '已派工')
         reassigned += 1
       } else {
-        await workOrderStore.dispatch({
-          defectId: row.defect.id,
-          team: dispatchForm.team,
-          dueDate: dispatchForm.dueDate
-        })
-        created += 1
+        freshIds.push(row.defect.id)
       }
     }
+    // 同叶片、同班组、同限期的缺陷合成一张作业单；跨叶片自动分组
+    const result = await workOrderStore.dispatchMany(freshIds, dispatchForm.team, dispatchForm.dueDate)
     dispatchVisible.value = false
     ElMessage.success(
-      `派工完成：新建 ${created} 张工单${reassigned > 0 ? `，改派 ${reassigned} 张` : ''}，班组「${dispatchForm.team}」，限期 ${dispatchForm.dueDate}`
+      `派工完成：新建 ${result.orders.length} 张作业单（覆盖 ${result.defectCount} 条缺陷）${
+        reassigned > 0 ? `，改派 ${reassigned} 张` : ''
+      }，班组「${dispatchForm.team}」，限期 ${dispatchForm.dueDate}`
     )
   } finally {
     dispatchSubmitting.value = false
@@ -426,8 +425,15 @@ function orderSummary(row: DefectRow): string {
   const orders = defectStore.ordersOfDefect(row.defect.id)
   if (orders.length === 0) return '未派工'
   return orders
-    .map((order) => `${order.team}｜${order.state}｜限期 ${order.dueDate}`)
+    .map((order) => `#${order.id.slice(-6)} ${order.team}｜${order.state}｜限期 ${order.dueDate}`)
     .join('；')
+}
+
+/** 修复结果登记进度（工单列的第二行） */
+function repairStatusText(row: DefectRow): string {
+  if (row.defect.state === '已修复') return '已修复闭环'
+  if (defectStore.ordersOfDefect(row.defect.id).length === 0) return '尚未派工'
+  return hasRepairResult(row.defect) ? '修复结果已登记' : '待复验（未登记修复结果）'
 }
 
 async function handleSeed(): Promise<void> {
@@ -583,20 +589,11 @@ const tableRows = computed(() => defectFilter.sortedRows.value)
             </span>
           </template>
         </el-table-column>
-        <el-table-column label="工单" min-width="200">
+        <el-table-column label="工单" min-width="220">
           <template #default="{ row }">
             <div class="cell-stack">
               <span>{{ orderSummary(row) }}</span>
-              <span class="muted">
-                工单状态：{{
-                  row.defect.state === '待处理' && defectStore.ordersOfDefect(row.defect.id).length === 0
-                    ? '尚未派工'
-                    : defectStore
-                        .ordersOfDefect(row.defect.id)
-                        .map((order) => order.state)
-                        .join('、') || '—'
-                }}
-              </span>
+              <span class="muted">{{ repairStatusText(row) }}</span>
             </div>
           </template>
         </el-table-column>
@@ -690,12 +687,12 @@ const tableRows = computed(() => defectFilter.sortedRows.value)
       </template>
     </el-dialog>
 
-    <el-dialog v-model="dispatchVisible" title="派发维修工单" width="600px" destroy-on-close>
+    <el-dialog v-model="dispatchVisible" title="派发维修作业单" width="600px" destroy-on-close>
       <el-alert
         type="info"
         :closable="false"
         show-icon
-        :title="`本次将处理 ${dispatchTargets.length} 条缺陷；已有工单的缺陷按「改派」更新班组与限期。`"
+        :title="`本次将处理 ${dispatchTargets.length} 条缺陷；同叶片的缺陷会合成一张作业单（同班组、同限期），已有作业单的缺陷按「改派」更新班组与限期。`"
         class="dispatch-alert"
       />
       <el-form label-width="110px">
