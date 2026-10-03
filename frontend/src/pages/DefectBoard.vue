@@ -160,7 +160,7 @@ async function removeSelected(): Promise<void> {
   if (selectedIds.value.length === 0) return
   try {
     await ElMessageBox.confirm(
-      `确认删除选中的 ${selectedIds.value.length} 条缺陷？其关联工单会一并删除。`,
+      `确认删除选中的 ${selectedIds.value.length} 条缺陷？它们会从相关作业单中摘除，只剩被删缺陷的作业单一并撤单。`,
       '批量删除确认',
       { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
     )
@@ -323,7 +323,9 @@ async function removeDefect(row: DefectRow): Promise<void> {
   try {
     await ElMessageBox.confirm(
       `确认删除这条 ${row.defect.type}（${row.defect.severity}）缺陷？${
-        orders.length > 0 ? `关联的 ${orders.length} 张工单会一并删除。` : ''
+        orders.length > 0
+          ? `它会从 ${orders.length} 张作业单中摘除，作业单只剩这一条缺陷时一并撤单。`
+          : ''
       }`,
       '删除缺陷确认',
       { type: 'warning', confirmButtonText: '确认删除', cancelButtonText: '取消' }
@@ -363,29 +365,16 @@ async function submitDispatch(): Promise<void> {
   if (dispatchTargets.value.length === 0) return
   dispatchSubmitting.value = true
   try {
-    let created = 0
-    let reassigned = 0
-    for (const row of dispatchTargets.value) {
-      const existing = workOrderStore.ordersOfDefect(row.defect.id)[0]
-      if (existing) {
-        await workOrderStore.updateWorkOrder(existing.id, {
-          team: dispatchForm.team,
-          dueDate: dispatchForm.dueDate
-        })
-        if (row.defect.state === '待处理') await defectStore.setState(row.defect.id, '已派工')
-        reassigned += 1
-      } else {
-        await workOrderStore.dispatch({
-          defectId: row.defect.id,
-          team: dispatchForm.team,
-          dueDate: dispatchForm.dueDate
-        })
-        created += 1
-      }
-    }
+    const result = await workOrderStore.dispatchDefects(
+      dispatchTargets.value.map((row) => row.defect.id),
+      dispatchForm.team,
+      dispatchForm.dueDate
+    )
     dispatchVisible.value = false
     ElMessage.success(
-      `派工完成：新建 ${created} 张工单${reassigned > 0 ? `，改派 ${reassigned} 张` : ''}，班组「${dispatchForm.team}」，限期 ${dispatchForm.dueDate}`
+      `派工完成：${result.defectCount} 条缺陷按叶片合并为 ${result.created} 张作业单${
+        result.reassigned > 0 ? `，改派 ${result.reassigned} 张已有作业单` : ''
+      }，班组「${dispatchForm.team}」，限期 ${dispatchForm.dueDate}`
     )
   } finally {
     dispatchSubmitting.value = false
@@ -426,7 +415,10 @@ function orderSummary(row: DefectRow): string {
   const orders = defectStore.ordersOfDefect(row.defect.id)
   if (orders.length === 0) return '未派工'
   return orders
-    .map((order) => `${order.team}｜${order.state}｜限期 ${order.dueDate}`)
+    .map((order) => {
+      const covered = order.defectIds?.length ?? 1
+      return `作业单 #${order.id.slice(-6)}（${covered} 条缺陷）｜${order.team}｜${order.state}｜限期 ${order.dueDate}`
+    })
     .join('；')
 }
 
@@ -583,12 +575,12 @@ const tableRows = computed(() => defectFilter.sortedRows.value)
             </span>
           </template>
         </el-table-column>
-        <el-table-column label="工单" min-width="200">
+        <el-table-column label="作业单" min-width="220">
           <template #default="{ row }">
             <div class="cell-stack">
               <span>{{ orderSummary(row) }}</span>
               <span class="muted">
-                工单状态：{{
+                作业单状态：{{
                   row.defect.state === '待处理' && defectStore.ordersOfDefect(row.defect.id).length === 0
                     ? '尚未派工'
                     : defectStore
@@ -695,7 +687,7 @@ const tableRows = computed(() => defectFilter.sortedRows.value)
         type="info"
         :closable="false"
         show-icon
-        :title="`本次将处理 ${dispatchTargets.length} 条缺陷；已有工单的缺陷按「改派」更新班组与限期。`"
+        :title="`本次处理 ${dispatchTargets.length} 条缺陷：同叶片、同班组、同限期的缺陷自动合并为一张作业单；已有作业单的缺陷按「改派」更新班组与限期。`"
         class="dispatch-alert"
       />
       <el-form label-width="110px">

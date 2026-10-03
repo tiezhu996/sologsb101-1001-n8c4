@@ -1,7 +1,14 @@
 import type { Blade } from '@/types/blade'
 import type { Segment } from '@/types/segment'
 import { DEFECT_STATES, DEFECT_TYPES, SEVERITIES, type Defect, type DefectState, type DefectType, type Severity } from '@/types/defect'
-import { WORK_ORDER_STATES, isOverdue, type WorkOrder, type WorkOrderState } from '@/types/workOrder'
+import {
+  WORK_ORDER_STATES,
+  isOverdue,
+  orderDefectIds,
+  repairResultOf,
+  type WorkOrder,
+  type WorkOrderState
+} from '@/types/workOrder'
 import { defectAreaCm2, percentOf, SEVERITY_WEIGHT } from '@/utils/severity'
 
 /** 报告页 / 导出文件里的一行分布统计 */
@@ -31,13 +38,21 @@ export interface ReportBladeSection {
   areaCm2: number
 }
 
-/** 报告中的工单行（带缺陷定位信息） */
+/**
+ * 报告中的工单跟踪行：一张作业单按所含缺陷展开为多行，
+ * 保证同一张单里的每一处损伤都出现在报告里（不漏项）。
+ */
 export interface ReportWorkOrderLine {
   order: WorkOrder
+  defectId: string
   defectType: DefectType
   severity: Severity
   bladeSerial: string
   segmentIndex: number
+  /** 该缺陷的复验结论；未登记为 null */
+  verdict: '已修复' | '未通过' | null
+  /** 该缺陷是否尚未完成（未登记或复验未通过） */
+  pendingRepair: boolean
   overdue: boolean
 }
 
@@ -150,31 +165,45 @@ export function buildTurbineReport(
   const defectById = new Map(source.defects.map((defect) => [defect.id, defect]))
   const today = generatedAt.slice(0, 10)
 
-  const workOrders: ReportWorkOrderLine[] = source.workOrders
-    .filter((order) => defectById.has(order.defectId))
-    .filter((order) => {
-      const defect = defectById.get(order.defectId) as Defect
-      const segment = defectToSegment.get(defect.segmentId)
-      const blade = segment ? bladeById.get(segment.bladeId) : undefined
-      return blade !== undefined
-    })
-    .sort((a, b) => a.dueDate.localeCompare(b.dueDate))
-    .map((order) => {
-      const defect = defectById.get(order.defectId) as Defect
-      const segment = defectToSegment.get(defect.segmentId) as Segment
-      const blade = bladeById.get(segment.bladeId) as Blade
-      return {
+  // 作业单按所含缺陷展开为多行：一张单超期，其每一处缺陷都在跟踪表中跟催
+  const workOrders: ReportWorkOrderLine[] = []
+  source.workOrders.forEach((order) => {
+    orderDefectIds(order).forEach((defectId) => {
+      const defect = defectById.get(defectId)
+      if (!defect) return
+      const segment: Segment | undefined = defectToSegment.get(defect.segmentId)
+      if (!segment) return
+      const blade = bladeById.get(segment.bladeId)
+      if (!blade) return
+      const verdict = repairResultOf(order, defectId)?.verdict ?? null
+      workOrders.push({
         order,
+        defectId,
         defectType: defect.type,
         severity: defect.severity,
         bladeSerial: blade.serial,
         segmentIndex: segment.index,
+        verdict,
+        pendingRepair: verdict !== '已修复',
         overdue: isOverdue(order, today)
-      }
+      })
     })
+  })
+  workOrders.sort((a, b) => {
+    const byDue = a.order.dueDate.localeCompare(b.order.dueDate)
+    if (byDue !== 0) return byDue
+    if (a.bladeSerial !== b.bladeSerial) return a.bladeSerial.localeCompare(b.bladeSerial)
+    return a.segmentIndex - b.segmentIndex
+  })
 
   const closedCount = defects.filter((defect) => defect.state === '已修复').length
   const riskScore = defects.reduce((sum, defect) => sum + SEVERITY_WEIGHT[defect.severity], 0)
+
+  // 作业单张数去重统计；缺陷行数用于检查是否漏项
+  const orderIdSet = new Set(workOrders.map((line) => line.order.id))
+  const overdueOrderIdSet = new Set(
+    workOrders.filter((line) => line.overdue).map((line) => line.order.id)
+  )
 
   return {
     app: 'gbwindblade',
@@ -192,8 +221,8 @@ export function buildTurbineReport(
       heavyPercent: percentOf(heavyCount, defects.length),
       closedPercent: percentOf(closedCount, defects.length),
       areaCm2,
-      workOrderCount: workOrders.length,
-      overdueCount: workOrders.filter((line) => line.overdue).length,
+      workOrderCount: orderIdSet.size,
+      overdueCount: overdueOrderIdSet.size,
       riskScore
     },
     severityDist: distribution(SEVERITIES as string[], severityCounts, defects.length),
@@ -269,10 +298,11 @@ export function reportToText(report: TurbineReport): string {
     lines.push('  （暂无工单）')
   }
   report.workOrders.forEach((line) => {
+    const repairText = line.verdict ? line.verdict : '未登记'
     lines.push(
-      `  #${line.order.id.slice(-6)} 叶片 ${line.bladeSerial} 第 ${line.segmentIndex} 段｜${line.defectType}（${line.severity}）｜${line.order.team}｜限期 ${line.order.dueDate}｜${line.order.state}${
-        line.overdue ? '（已超期）' : ''
-      }｜验收人 ${line.order.acceptor || '—'}`
+      `  #${line.order.id.slice(-6)} 叶片 ${line.bladeSerial} 第 ${line.segmentIndex} 段｜${line.defectType}（${line.severity}）｜${line.order.team}｜限期 ${line.order.dueDate}｜${line.order.state}｜复验 ${repairText}${
+        line.pendingRepair ? '（待复验）' : ''
+      }${line.overdue ? '（已超期）' : ''}｜验收人 ${line.order.acceptor || '—'}`
     )
   })
   return lines.join('\n')

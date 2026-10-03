@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, reactive, ref } from 'vue'
-import { db } from '@/utils/db'
+import { db, pruneDefectsFromWorkOrders } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   createEmptyDefectFilter,
@@ -13,7 +13,7 @@ import {
 import type { Segment } from '@/types/segment'
 import type { Blade } from '@/types/blade'
 import type { Turbine } from '@/types/turbine'
-import type { WorkOrder } from '@/types/workOrder'
+import { orderDefectIds, type WorkOrder } from '@/types/workOrder'
 import { compareSeverity, defectAreaCm2, percentOf } from '@/utils/severity'
 
 /** 缺陷标注台的一行：缺陷 + 所属分段 + 叶片 + 机组 */
@@ -196,7 +196,7 @@ export const useDefectStore = defineStore('defect', () => {
   }
 
   function ordersOfDefect(defectId: string): WorkOrder[] {
-    return workOrders.value.filter((order) => order.defectId === defectId)
+    return workOrders.value.filter((order) => orderDefectIds(order).includes(defectId))
   }
 
   function toggleSelection(id: string): void {
@@ -226,10 +226,10 @@ export const useDefectStore = defineStore('defect', () => {
     await defectsTable.update(id, patch)
   }
 
-  /** 级联删除缺陷及其维修工单 */
+  /** 级联删除缺陷：从作业单中摘除该缺陷，作业单被摘空则一并删除 */
   async function removeDefect(id: string): Promise<void> {
     await db.transaction('rw', [db.defects, db.workOrders], async () => {
-      await db.workOrders.where('defectId').equals(id).delete()
+      await pruneDefectsFromWorkOrders([id])
       await db.defects.delete(id)
     })
     selectedIds.delete(id)
@@ -238,7 +238,7 @@ export const useDefectStore = defineStore('defect', () => {
   async function removeDefects(ids: string[]): Promise<number> {
     if (ids.length === 0) return 0
     await db.transaction('rw', [db.defects, db.workOrders], async () => {
-      await db.workOrders.where('defectId').anyOf(ids).delete()
+      await pruneDefectsFromWorkOrders(ids)
       await db.defects.bulkDelete(ids)
     })
     ids.forEach((id) => selectedIds.delete(id))

@@ -7,10 +7,39 @@ import {
   type BackupPayload
 } from '@/utils/db'
 import { reportFileName, type TurbineReport } from '@/utils/report'
+import type { WorkOrder } from '@/types/workOrder'
 
 const COLLECTIONS = ['turbines', 'blades', 'segments', 'defects', 'workOrders'] as const
 
 type CollectionKey = (typeof COLLECTIONS)[number]
+
+/** 归一化作业单：兼容旧版「一条缺陷一张工单（defectId）」备份 */
+export function normalizeWorkOrders(orders: WorkOrder[]): WorkOrder[] {
+  return orders.map((order) => {
+    const ids =
+      Array.isArray(order.defectIds) && order.defectIds.length > 0
+        ? order.defectIds
+        : typeof order.defectId === 'string' && order.defectId
+          ? [order.defectId]
+          : []
+    const repairResults = order.repairResults ?? {}
+    const normalized: WorkOrder = { ...order, defectIds: ids, repairResults }
+    // 已闭环的旧单据：唯一缺陷补登已修复，保持闭环状态一致
+    if (normalized.state === '已闭环') {
+      ids.forEach((defectId) => {
+        if (!repairResults[defectId]) {
+          repairResults[defectId] = {
+            defectId,
+            verdict: '已修复',
+            note: '历史备份导入补登',
+            registeredAt: normalized.closedAt ?? Date.now()
+          }
+        }
+      })
+    }
+    return normalized
+  })
+}
 
 /** 校验备份对象的必备字段，返回错误信息数组（为空表示通过） */
 export function validateBackup(input: unknown): {
@@ -37,7 +66,7 @@ export function validateBackup(input: unknown): {
     blades: obj.blades ?? [],
     segments: obj.segments ?? [],
     defects: obj.defects ?? [],
-    workOrders: obj.workOrders ?? []
+    workOrders: normalizeWorkOrders((obj.workOrders ?? []) as WorkOrder[])
   }
   return { ok: true, errors, payload }
 }
@@ -160,11 +189,21 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     defectIdMap.set(defect.id, id)
     return { ...defect, id, segmentId: segmentIdMap.get(defect.segmentId) ?? defect.segmentId }
   })
-  const workOrders = payload.workOrders.map((order) => ({
-    ...order,
-    id: createId('wo'),
-    defectId: defectIdMap.get(order.defectId) ?? order.defectId
-  }))
+  const workOrders = normalizeWorkOrders(payload.workOrders).map((order) => {
+    const newDefectIds = order.defectIds.map((id) => defectIdMap.get(id) ?? id)
+    const repairResults: WorkOrder['repairResults'] = {}
+    Object.entries(order.repairResults ?? {}).forEach(([oldId, result]) => {
+      const newId = defectIdMap.get(oldId) ?? oldId
+      repairResults[newId] = { ...result, defectId: newId }
+    })
+    return {
+      ...order,
+      id: createId('wo'),
+      defectIds: newDefectIds,
+      defectId: newDefectIds[0],
+      repairResults
+    }
+  })
 
   return { ...payload, turbines, blades, segments, defects, workOrders }
 }

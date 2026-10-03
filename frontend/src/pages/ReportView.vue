@@ -456,15 +456,17 @@ watch(bladePanels, (panels) => {
         <div class="section-card">
           <div class="section-card__head">
             <h3>维修工单跟踪</h3>
-            <span class="muted">共 {{ report.workOrders.length }} 张</span>
+            <span class="muted">
+              共 {{ new Set(report.workOrders.map((line) => line.order.id)).size }} 张作业单 · {{ report.workOrders.length }} 条缺陷明细
+            </span>
           </div>
           <el-table :data="report.workOrders" size="small" border>
-            <el-table-column label="工单号" width="120">
+            <el-table-column label="作业单号" width="120">
               <template #default="{ row }">
                 <span class="mono">#{{ row.order.id.slice(-6) }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="定位" min-width="180">
+            <el-table-column label="定位" min-width="160">
               <template #default="{ row }">
                 叶片 {{ row.bladeSerial }}｜第 {{ row.segmentIndex }} 段
               </template>
@@ -472,19 +474,32 @@ watch(bladePanels, (panels) => {
             <el-table-column label="缺陷" min-width="150">
               <template #default="{ row }">{{ row.defectType }}（{{ row.severity }}）</template>
             </el-table-column>
-            <el-table-column label="班组" prop="order.team" width="140" />
-            <el-table-column label="限期" width="130">
+            <el-table-column label="班组" prop="order.team" width="130" />
+            <el-table-column label="限期" width="120">
               <template #default="{ row }">
                 <span class="mono">{{ row.order.dueDate }}</span>
               </template>
             </el-table-column>
-            <el-table-column label="状态" width="110">
+            <el-table-column label="作业单状态" width="110">
+              <template #default="{ row }">{{ row.order.state }}</template>
+            </el-table-column>
+            <el-table-column label="复验结论" width="110">
               <template #default="{ row }">
-                {{ row.order.state }}
-                <el-tag v-if="row.overdue" size="small" type="danger" effect="dark">超期</el-tag>
+                <el-tag v-if="row.verdict === '已修复'" size="small" type="success">已修复</el-tag>
+                <el-tag v-else-if="row.verdict === '未通过'" size="small" type="danger" effect="dark">未通过</el-tag>
+                <el-tag v-else size="small" type="info" effect="plain">未登记</el-tag>
               </template>
             </el-table-column>
-            <el-table-column label="验收人" width="110">
+            <el-table-column label="跟催" width="90">
+              <template #default="{ row }">
+                <el-tag v-if="row.overdue" size="small" type="danger" effect="dark">超期</el-tag>
+                <el-tag v-else-if="row.pendingRepair && row.order.state === '待验收'" size="small" type="warning">
+                  待复验
+                </el-tag>
+                <span v-else class="muted">—</span>
+              </template>
+            </el-table-column>
+            <el-table-column label="验收人" width="100">
               <template #default="{ row }">{{ row.order.acceptor || '—' }}</template>
             </el-table-column>
             <template #empty>

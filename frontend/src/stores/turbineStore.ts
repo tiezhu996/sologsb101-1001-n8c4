@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
-import { db, readUiPrefs, writeUiPrefs } from '@/utils/db'
+import { db, pruneDefectsFromWorkOrders, readUiPrefs, writeUiPrefs } from '@/utils/db'
 import { useIdbTable } from '@/hooks/useIdbTable'
 import {
   DEFAULT_BLADE_COUNT,
@@ -17,7 +17,7 @@ import {
 } from '@/types/blade'
 import type { Segment } from '@/types/segment'
 import type { Defect } from '@/types/defect'
-import type { WorkOrder } from '@/types/workOrder'
+import { orderDefectIds, type WorkOrder } from '@/types/workOrder'
 import { percentOf } from '@/utils/severity'
 
 /** 新建机组的入参：除机组本体外，同时给出派生叶片所需的默认参数 */
@@ -102,7 +102,9 @@ export const useTurbineStore = defineStore('turbine', () => {
 
   function workOrdersOfTurbine(turbineId: string): WorkOrder[] {
     const defectIds = new Set(defectsOfTurbine(turbineId).map((defect) => defect.id))
-    return workOrders.value.filter((order) => defectIds.has(order.defectId))
+    return workOrders.value.filter((order) =>
+      orderDefectIds(order).some((id) => defectIds.has(id))
+    )
   }
 
   /** 机组卡片回显的缺陷总数与未闭环数 */
@@ -290,7 +292,7 @@ export const useTurbineStore = defineStore('turbine', () => {
       'rw',
       [db.blades, db.segments, db.defects, db.workOrders],
       async () => {
-        await db.workOrders.where('defectId').anyOf(defectIds).delete()
+        await pruneDefectsFromWorkOrders(defectIds)
         await db.defects.bulkDelete(defectIds)
         await db.segments.bulkDelete(segmentIds)
         await db.blades.delete(id)
@@ -315,7 +317,7 @@ export const useTurbineStore = defineStore('turbine', () => {
       'rw',
       [db.turbines, db.blades, db.segments, db.defects, db.workOrders],
       async () => {
-        await db.workOrders.where('defectId').anyOf(defectIds).delete()
+        await pruneDefectsFromWorkOrders(defectIds)
         await db.defects.bulkDelete(defectIds)
         await db.segments.bulkDelete(segmentIds)
         await db.blades.bulkDelete(bladeIds)

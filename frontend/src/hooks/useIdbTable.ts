@@ -1,6 +1,21 @@
 import { liveQuery } from 'dexie'
-import { onScopeDispose, ref, shallowRef, type Ref } from 'vue'
+import { onScopeDispose, ref, shallowRef, toRaw, isProxy, type Ref } from 'vue'
 import { createId, db } from '@/utils/db'
+
+/**
+ * 深度解包 Vue 响应式代理：写入 IndexedDB 前 structured clone 不接受 Proxy，
+ * 嵌套对象（如 repairResults）需要逐层 toRaw。
+ */
+function deepToRaw<T>(value: T): T {
+  const raw = isProxy(value) ? toRaw(value) : value
+  if (Array.isArray(raw)) return raw.map((item) => deepToRaw(item)) as T
+  if (raw && typeof raw === 'object') {
+    return Object.fromEntries(
+      Object.entries(raw as Record<string, unknown>).map(([key, item]) => [key, deepToRaw(item)])
+    ) as T
+  }
+  return raw
+}
 
 export type IdbRecord = { id: string; createdAt?: number; updatedAt?: number }
 
@@ -82,22 +97,23 @@ export function useIdbTable<T extends IdbRecord>(
 
   const create = async (payload: NewRecord<T>, idPrefix = 'row'): Promise<T> => {
     const now = Date.now()
-    const record = {
+    const record = deepToRaw({
       ...(payload as object),
       id: payload.id ?? createId(idPrefix),
       createdAt: payload.createdAt ?? now,
       updatedAt: payload.updatedAt ?? now
-    } as T
+    }) as T
     await table.put(record)
     return record
   }
 
   const update = async (id: string, patch: Partial<T>): Promise<void> => {
-    await table.update(id, { ...patch, updatedAt: Date.now() } as never)
+    // patch 可能含 Vue 响应式代理（如嵌套 repairResults），IndexedDB structured clone 前深解包
+    await table.update(id, deepToRaw({ ...patch, updatedAt: Date.now() }) as never)
   }
 
   const upsert = async (row: T): Promise<void> => {
-    await table.put({ ...row, updatedAt: Date.now() } as T)
+    await table.put(deepToRaw({ ...row, updatedAt: Date.now() }) as T)
   }
 
   const remove = async (id: string): Promise<void> => {
